@@ -17,6 +17,7 @@ from blender_api_msgs.msg import Target, EmotionState, SetGesture
 from std_msgs.msg import String, Float64
 from r2_perception.msg import Float32XYZ, CandidateFace, CandidateHand, CandidateSaliency
 from enum import Enum
+from hr_msgs.msg import TTS
 
 
 class State(Enum):
@@ -52,7 +53,7 @@ class EyeContact(Enum):
 class Config:
     def __init__(self):
         self.saliency_count = 10  # timer counts between saliency switch
-        self.faces_count = 10  # timer counts between face switch
+        self.faces_count = 15  # timer counts between face switch
         self.eyes_count = 10  # timer counts between eye switch
         self.keep_time = 0.5  # time to keep observations around as useful
 
@@ -66,14 +67,11 @@ class Behavior:
 
         # setup face, hand and saliency structures
         self.faces = {}  # index = cface_id, which should be relatively steady from vision_pipeline
-            # it contains a dictionary indexed with ts, so faces are maintained similarly to saliency vectors
-        self.current_face = 0  # cface_id of current face
-        self.last_face = 0  # most recent cface_id of added face
-        self.last_face_ts = 0  # most recent ts of added face
-        self.hands = {}  # index = ts, it assumes only one hand, old hands removed after time
-        self.last_hand_ts = 0  # most recent ts of added hand
+        self.current_face_id = 0  # cface_id of current face
+        self.last_face_id = 0  # most recent cface_id of added face
+        self.hand = None  # current hand
         self.saliencies = {}  # index = ts, and old saliency vectors will be removed after time
-        self.current_saliency = 0  # ts of current saliency vector
+        self.current_saliency_ts = 0  # ts of current saliency vector
         self.current_eye = 0  # current eye (0 = left, 1 = right, 2 = mouth)
 
         # counters
@@ -81,7 +79,6 @@ class Behavior:
         self.faces_counter = self.config.faces_count  # counter to switch between faces
         self.eyes_counter = self.config.eyes_count  # counter to switch between eyes/mouth for eyecontact
 
-        # current
         # setup state machine
         self.lookat = LookAt.IDLE
         self.eyecontact = EyeContact.IDLE
@@ -93,10 +90,15 @@ class Behavior:
         rospy.Subscriber('/{}/perception/realsense/chand'.format(self.robot_name), CandidateHand, self.HandleHand)
         rospy.Subscriber('/{}/perception/wideangle/csaliency'.format(self.robot_name), CandidateSaliency, self.HandleSaliency)
 
+        rospy.Subscriber('/{}/chat_events'.format(self.robot_name), String, self.HandleChatEvents)
+        rospy.Subscriber('/{}/speech_events'.format(self.robot_name), String, self.HandleSpeechEvents)
+
         self.head_focus_pub = rospy.Publisher('/blender_api/set_face_target', Target, queue_size=1)
         self.gaze_focus_pub = rospy.Publisher('/blender_api/set_gaze_target', Target, queue_size=1)
         self.expressions_pub = rospy.Publisher('/blender_api/set_emotion_state', EmotionState, queue_size=1)
         self.gestures_pub = rospy.Publisher('/blender_api/set_gesture', SetGesture, queue_size=1)
+
+        self.tts_pub = rospy.Publisher('/{}/tts'.format(self.robot_name), TTS, queue_size=1)
 
         self.hand_events_pub = rospy.Publisher('/hand_events', String, queue_size=1)
 
@@ -105,8 +107,18 @@ class Behavior:
         # and start the timer at 10Hz
         self.timer = rospy.Timer(rospy.Duration(0.1),self.HandleTimer)
 
-        # initialize first state
+        # initialize states
+        self.SetLookAt(LookAt.IDLE)
+        self.SetEyeContact(EyeContact.IDLE)
         self.SetState(State.IDLE)
+
+
+    def Say(self,text):
+        # publish TTS message
+        msg = TTS()
+        msg.text = text
+        msg.lang = 'en-US'
+        self.tts_pub.publish(msg)
 
 
     def SetHeadFocus(self,pos):
@@ -117,6 +129,42 @@ class Behavior:
         msg.z = pos.z
         msg.speed = 5.0
         self.head_focus_pub.publish(msg)
+
+
+    def SelectNextFace(self):
+        # switch to the next (or first) face
+        if len(self.faces) == 0:
+            # there are no faces, so select none
+            self.current_face_id = 0
+            return
+        if self.current_face_id == 0:
+            self.current_face_id = self.faces.keys()[0]
+        else:
+            if self.current_face_id in self.faces:
+                next = self.faces.keys().index(self.current_face_id) + 1
+                if next >= len(self.faces.keys()):
+                    next = 0
+            else:
+                next = 0
+            self.current_face_id = self.faces.keys()[next]
+
+
+    def SelectNextSaliency(self):
+        # switch to the next (or first) saliency vector
+        if len(self.saliencies) == 0:
+            # there are no saliency vectors, so select none
+            self.current_saliency_ts = 0
+            return
+        if self.current_saliency_ts == 0:
+            self.current_saliency_ts = self.saliencies.keys()[0]
+        else:
+            if self.current_saliency_ts in self.saliencies:
+                next = self.saliencies.keys().index(self.current_saliency_ts) + 1
+                if next >= len(self.saliencies):
+                    next = 0
+            else:
+                next = 0
+            self.current_saliency_ts = self.saliencies.keys()[next]
 
 
     def HandleTimer(self,data):
@@ -139,29 +187,27 @@ class Behavior:
             self.saliency_counter -= 1
             if self.saliency_counter == 0:
                 self.saliency_counter = self.config.saliency_count
-                # TODO: switch to next saliency vector
-            # TODO: head_focus_pub to current saliency vector
+                self.SelectNextSaliency()
+            if self.current_saliency_ts != 0:
+                cursaliency = self.saliencies[self.current_saliency_ts]
+                self.SetHeadFocus(self.saliencies[self.current_saliency_ts].direction)
 
         elif self.lookat == LookAt.HAND:
             # stare at hand
-            if len(self.hands) > 0:
-                curhand = self.hands[self.last_hand_ts]
-                self.SetHeadFocus(curhand.position)
+            if self.hand != None:
+                self.SetHeadFocus(self.hand.position)
 
         else:
             if self.lookat == LookAt.ALL_FACES:
                 self.faces_counter -= 1
                 if self.faces_counter == 0:
                     self.faces_counter = self.config.faces_count
-                    # TODO: switch to next face
+                    self.SelectNextFace()
 
-            # just take the most recent face for now
-            if len(self.faces) > 0:
-                curface = self.faces[self.last_face][self.last_face_ts]
-                face_pos = Float32XYZ()
-                face_pos.x = curface.position.x
-                face_pos.y = curface.position.y
-                face_pos.z = curface.position.z
+            # take the current face
+            if self.current_face_id != 0:
+                curface = self.faces[self.current_face_id]
+                face_pos = curface.position
 
                 # ==== handle eyecontact (only for LookAt.ONE_FACE and LookAt.ALL_FACES)
 
@@ -236,31 +282,21 @@ class Behavior:
         prune_before_time = ts - rospy.Duration.from_sec(self.config.keep_time)
 
         # flush faces dictionary, update current face accordingly, switch away from State.ALL_FACES if one face left, away from State.ONE_FACE if no face left
-        for fid in self.faces.keys():
-            # list of keys to be removed
-            to_be_removed = []
-            # find all keys that are earlier than prune_before_time
-            for key in self.faces[fid].keys():
-                if key < prune_before_time:
-                    to_be_removed.append(key)
-            # remove the elements
-            for key in to_be_removed:
-                del self.faces[fid][key]
-            # if all elements are removed, remove this face
-            if len(self.faces[fid]) == 0:
-                del self.faces[fid]
-        # TODO: if that means there is only one face left, switch back to State.ONE_FACE
-        # TODO: and if it means there is no face left, switch back to State.IDLE (or one of the others)
-                
-        # flush hands dictionary, switch away from State.AMAZED if no hands left
         to_be_removed = []
-        for key in self.hands.keys():
-            if key < prune_before_time:
-                to_be_removed.append(key)
+        for face in self.faces.values():
+            if face.ts < prune_before_time:
+                to_be_removed.append(face.cface_id)
         # remove the elements
         for key in to_be_removed:
-            del self.hands[key]
-        # TODO: if all hands are removed, switch back to State.INTERESTED (or one of the others)            
+            del self.faces[key]
+            # make sure the selected face is always valid
+            if self.current_face_id == key:
+                self.SelectNextFace()
+                
+        # remove hand if it is too old
+        if self.hand != None:
+            if self.hand.ts < prune_before_time:
+                self.hand = None
 
         # flush saliency dictionary, switch away from State.INTERESTED if no saliency vectors left
         to_be_removed = []
@@ -270,7 +306,11 @@ class Behavior:
         # remove the elements
         for key in to_be_removed:
             del self.saliencies[key]
-        # TODO: if all saliencies are removed, switch back to State.IDLE
+            # make sure the selected saliency is always valid
+            if self.current_saliency_ts == key:
+                self.SelectNextSaliency()
+
+        # TODO: after some time, 
 
 
     def SetLookAt(self, newlookat):
@@ -345,27 +385,39 @@ class Behavior:
             ()
 
         elif self.state == State.IDLE:
-            # TEST: start looking at a face and switch between eyes
-            self.SetLookAt(LookAt.ONE_FACE)
-            self.SetEyeContact(EyeContact.BOTH_EYES)
+            # robot is looking around, smiling every now and then, wideangle and realsense are turned up, eyes turned down
+            self.SetLookAt(LookAt.IDLE)
+            self.SetEyeContact(EyeContact.IDLE)
 
         elif self.state == State.INTERESTED:
-            ()
+            # robot looks at saliency, blinking extra times, maybe more smiling
+            self.SetLookAt(LookAt.SALIENCY)
+            self.SetEyeContact(EyeContact.IDLE)
 
         elif self.state == State.AMAZED:
-            ()
+            # robot looks at saliency or hand, eyes open, eyebrows raised, smiling or mouth slightly open
+            self.SetLookAt(LookAt.HAND)
+            self.SetEyeContact(EyeContact.IDLE)
 
         elif self.state == State.USERS_IDLE:
-            ()
+            # robot is aware of faces, looking at the faces sporadically, eyecontact sometimes
+            self.SetLookAt(LookAt.IDLE)
+            self.SetEyeContact(EyeContact.IDLE)
 
         elif self.state == State.USERS_AMAZED:
-            ()
+            # robot is aware of faces, looking at saliency or hand, eyes open, eyebrows raised, smiling or mouth slightly open
+            self.SetLookAt(LookAt.HAND)
+            self.SetEyeContact(EyeContact.IDLE)
 
         elif self.state == State.USERS_SPEAKING:
-            ()
+            # robot is speaking to the faces, looking arrogantly away, maybe sometimes look at the faces
+            self.SetLookAt(LookAt.AVOID)
+            self.SetEyeContact(EyeContact.IDLE)
 
         elif self.state == State.USERS_LISTENING:
-            ()
+            # robot is listening, staring at the face that speaks (one for now), eyecontact full on
+            self.SetLookAt(LookAt.ONE_FACE)
+            self.SetEyeContact(EyeContact.TRIANGLE)
 
 
     def HandleConfig(self, config, level):
@@ -373,20 +425,42 @@ class Behavior:
 
 
     def HandleFace(self, msg):
-        if msg.cface_id not in self.faces.keys():
-            self.faces[msg.cface_id] = {}
-        self.faces[msg.cface_id][msg.ts] = msg
+        self.faces[msg.cface_id] = msg
         self.last_face = msg.cface_id
-        self.last_face_ts = msg.ts
+
+        # TEMP: if there is no current face, make this the current face
+        if self.current_face_id == 0:
+            self.current_face_id = msg.cface_id
 
 
     def HandleHand(self, msg):
-        self.hands[msg.ts] = msg
-        self.last_hand_ts = msg.ts
+        self.hand = msg
 
 
     def HandleSaliency(self, msg):
         self.saliencies[msg.ts] = msg
+
+        # TEMP: if there is no current saliency vector, make this the current saliency vector
+        if self.current_saliency_ts == 0:
+            self.current_saliency_ts = msg.ts
+
+
+    def HandleChatEvents(self, msg):
+        # triggered when someone starts talking to the robot
+
+        # go to listening state
+        self.SetState(State.USERS_LISTENING)
+
+
+    def HandleSpeechEvents(self, msg):
+        print("{}".format(msg))
+        # triggered when the robot starts or stops talking
+        if msg.data == "start":
+            # robot starts talking
+            self.SetState(State.USERS_SPEAKING)
+        elif msg.data == "stop":
+            # robot stops talking
+            self.SetState(State.INTERESTED)
 
 
 if __name__ == "__main__":
