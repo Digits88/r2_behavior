@@ -10,12 +10,13 @@ import numpy as np
 import json
 import os
 import yaml
+import random
 from dynamic_reconfigure.server import Server
 import dynamic_reconfigure.client
 from r2_behavior.cfg import BehaviorConfig
 from blender_api_msgs.msg import Target, EmotionState, SetGesture
 from std_msgs.msg import String, Float64
-from r2_perception.msg import Float32XYZ, CandidateFace, CandidateHand, CandidateSaliency
+from r2_perception.msg import Float32XYZ, CandidateFace, CandidateHand, CandidateSaliency, AudioDirection, MotionVector
 from enum import Enum
 from hr_msgs.msg import TTS
 
@@ -52,9 +53,12 @@ class EyeContact(Enum):
 
 class Config:
     def __init__(self):
-        self.saliency_count = 10  # timer counts between saliency switch
-        self.faces_count = 15  # timer counts between face switch
-        self.eyes_count = 10  # timer counts between eye switch
+        self.saliency_counter_min = 8  # min. timer counts between saliency switch
+        self.saliency_counter_max = 20  # max. timer counts between saliency switch
+        self.faces_counter_min = 10  # min. timer counts between face switch
+        self.faces_counter_max = 30  # max. timer counts between face switch
+        self.eyes_counter_min = 5  # min. timer counts between eye switch
+        self.eyes_counter_max = 15  # max. timer counts between eye switch
         self.keep_time = 0.5  # time to keep observations around as useful
 
 
@@ -75,9 +79,9 @@ class Behavior:
         self.current_eye = 0  # current eye (0 = left, 1 = right, 2 = mouth)
 
         # counters
-        self.saliency_counter = self.config.saliency_count  # counter to switch between saliency
-        self.faces_counter = self.config.faces_count  # counter to switch between faces
-        self.eyes_counter = self.config.eyes_count  # counter to switch between eyes/mouth for eyecontact
+        self.saliency_counter = random.randint(self.config.saliency_counter_min,self.config.saliency_counter_max)
+        self.faces_counter = random.randint(self.config.faces_counter_min,self.config.faces_counter_max)
+        self.eyes_counter = random.randint(self.config.eyes_counter_min,self.config.eyes_counter_max)
 
         # setup state machine
         self.lookat = LookAt.IDLE
@@ -89,6 +93,8 @@ class Behavior:
         rospy.Subscriber('/{}/perception/realsense/cface'.format(self.robot_name), CandidateFace, self.HandleFace)
         rospy.Subscriber('/{}/perception/realsense/chand'.format(self.robot_name), CandidateHand, self.HandleHand)
         rospy.Subscriber('/{}/perception/wideangle/csaliency'.format(self.robot_name), CandidateSaliency, self.HandleSaliency)
+        rospy.Subscriber('/{}/perception/acousticmagic/raw_audiodir'.format(self.robot_name), AudioDirection, self.HandleAudioDirection)
+        #rospy.Subscriber('/{}/perception/motion/raw_sensors'.format(self.robot_name), MotionVector, self.HandleMotion)
 
         rospy.Subscriber('/{}/chat_events'.format(self.robot_name), String, self.HandleChatEvents)
         rospy.Subscriber('/{}/speech_events'.format(self.robot_name), String, self.HandleSpeechEvents)
@@ -186,7 +192,7 @@ class Behavior:
         elif self.lookat == LookAt.SALIENCY:
             self.saliency_counter -= 1
             if self.saliency_counter == 0:
-                self.saliency_counter = self.config.saliency_count
+                self.saliency_counter = random.randint(self.config.saliency_counter_min,self.config_saliency_counter_max)
                 self.SelectNextSaliency()
             if self.current_saliency_ts != 0:
                 cursaliency = self.saliencies[self.current_saliency_ts]
@@ -201,7 +207,7 @@ class Behavior:
             if self.lookat == LookAt.ALL_FACES:
                 self.faces_counter -= 1
                 if self.faces_counter == 0:
-                    self.faces_counter = self.config.faces_count
+                    self.faces_counter = random.randint(self.config.faces_counter_min,self.config_faces_counter_max)
                     self.SelectNextFace()
 
             # take the current face
@@ -245,7 +251,7 @@ class Behavior:
                     # switch between eyes back and forth
                     self.eyes_counter -= 1
                     if self.eyes_counter == 0:
-                        self.eyes_counter = self.config.eyes_count
+                        self.eyes_counter = random.randint(self.config.eyes_counter_min,self.config.eyes_counter_max)
                         if self.current_eye == 1:
                             self.current_eye = 0
                         else:
@@ -261,7 +267,7 @@ class Behavior:
                     # cycle between eyes and mouth
                     self.eyes_counter -= 1
                     if self.eyes_counter == 0:
-                        self.eyes_counter = self.config.eyes_count
+                        self.eyes_counter = random.randint(self.config.eyes_counter_min,self.config.eyes_counter_max)
                         if self.current_eye == 2:
                             self.current_eye = 0
                         else:
@@ -281,7 +287,7 @@ class Behavior:
 
         prune_before_time = ts - rospy.Duration.from_sec(self.config.keep_time)
 
-        # flush faces dictionary, update current face accordingly, switch away from State.ALL_FACES if one face left, away from State.ONE_FACE if no face left
+        # flush faces dictionary, update current face accordingly
         to_be_removed = []
         for face in self.faces.values():
             if face.ts < prune_before_time:
@@ -298,7 +304,7 @@ class Behavior:
             if self.hand.ts < prune_before_time:
                 self.hand = None
 
-        # flush saliency dictionary, switch away from State.INTERESTED if no saliency vectors left
+        # flush saliency dictionary
         to_be_removed = []
         for key in self.saliencies.keys():
             if key < prune_before_time:
@@ -309,8 +315,6 @@ class Behavior:
             # make sure the selected saliency is always valid
             if self.current_saliency_ts == key:
                 self.SelectNextSaliency()
-
-        # TODO: after some time, 
 
 
     def SetLookAt(self, newlookat):
@@ -329,19 +333,19 @@ class Behavior:
 
         elif self.lookat == LookAt.SALIENCY:
             # reset saliency switch counter
-            self.saliency_counter = self.config.saliency_count
+            self.saliency_counter = random.randint(self.config.saliency_counter_min,self.config.saliency_counter_max)
 
         elif self.lookat == LookAt.HAND:
             ()
 
         elif self.lookat == LookAt.ONE_FACE:
             # reset eye switch counter
-            self.eyes_counter = self.config.eyes_count
+            self.eyes_counter = random.randint(self.config.eyes_counter_min,self.config.eyes_counter_max)
 
         elif self.lookat == LookAt.ALL_FACES:
             # reset eye and face switch counters
-            self.faces_counter = self.config.faces_count
-            self.eyes_counter = self.config.eyes_count
+            self.faces_counter = random.randint(self.config.faces_counter_min,self.config.faces_counter_max)
+            self.eyes_counter = random.randint(self.config.eyes_counter_min,self.config.eyes_counter_max)
 
 
     def SetEyeContact(self, neweyecontact):
@@ -362,10 +366,10 @@ class Behavior:
             ()
 
         elif self.eyecontact == EyeContact.BOTH_EYES:
-            self.eyes_counter = self.config.eyes_count
+            self.eyes_counter = random.randint(self.config.eyes_counter_min,self.config.eyes_counter_max)
 
         elif self.eyecontact == EyeContact.TRIANGLE:
-            self.eyes_counter = self.config.eyes_count
+            self.eyes_counter = random.randint(self.config.eyes_counter_min,self.config.eyes_counter_max)
 
 
     # ==== MAIN STATE MACHINE
@@ -448,8 +452,11 @@ class Behavior:
     def HandleChatEvents(self, msg):
         # triggered when someone starts talking to the robot
 
-        # go to listening state
-        self.SetState(State.USERS_LISTENING)
+        print("user starts talking to the robot")
+
+        # go to listening state if robot is not talking
+        if self.state != State.USERS_SPEAKING:
+            self.SetState(State.USERS_LISTENING)
 
 
     def HandleSpeechEvents(self, msg):
@@ -457,10 +464,22 @@ class Behavior:
         # triggered when the robot starts or stops talking
         if msg.data == "start":
             # robot starts talking
+            print("Sophia starts talking")
             self.SetState(State.USERS_SPEAKING)
         elif msg.data == "stop":
             # robot stops talking
-            self.SetState(State.INTERESTED)
+            print("Sophia stops talking")
+            self.SetState(State.USERS_IDLE)
+
+
+    def HandleAudioDirection(self, msg):
+        # use to correlate with person speaking to select correct current face
+        ()
+
+
+    def HandleMotion(self, msg):
+        # use to trigger awareness of people even without seeing them
+        ()
 
 
 if __name__ == "__main__":
